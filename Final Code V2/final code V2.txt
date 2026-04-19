@@ -1,0 +1,1091 @@
+---------------------
+Laptop Controller 
+---------------------
+import pygame
+import socket
+import time
+import sys
+import threading
+import binascii
+
+# =======================
+# CONFIGURABLE SETTINGS
+# =======================
+RASPBERRY_PI_IP = '192.168.1.20' # IP address of the Raspberry Pi
+PORT = 5000                     # Port for TCP connection
+MAX_SPEED = 255                 # Maximum motor speed (0-255)
+DEADZONE = 0.12                 # Joystick deadzone
+RECONNECT_DELAY = 3             # Seconds to wait before attempting reconnect
+
+# =======================
+# COMMUNICATION PROTOCOL DEFINITIONS
+# =======================
+START_DELIMITER = b'<'
+END_DELIMITER = b'>'
+PACKET_TYPE_MOTOR = b'M'
+PACKET_TYPE_SENSOR = b'S'
+
+# =======================
+# GLOBAL VARIABLES
+# =======================
+sock = None
+connected = False
+grip_mode = 1  # 1 for normal, -1 for inverted
+rot_mode = 1   # 1 for normal, -1 for inverted
+R1_pressed = False
+L1_pressed = False
+SELECT_pressed = False # For stabilization mode toggle
+
+stab_mode = 0 # 0 = OFF, 1 = ON
+leak_override = 0 # 0 = Normal, 1 = Emergency Stop (sent to Arduino)
+
+# Sensor data variables (received from Arduino)
+temp_bmp = 0.0
+pres_bmp = 0.0
+pres_ms = 0.0
+depth_ms = 0.0
+roll_mpu = 0.0
+pitch_mpu = 0.0
+leak_status = 0 # 0 = No Leak, 1 = Leak Detected (from Arduino)
+
+# Threading events and locks
+shutdown_event = threading.Event()
+socket_lock = threading.Lock()
+
+def calculate_checksum(data_bytes):
+    checksum = 0
+    for byte_val in data_bytes:
+        checksum ^= byte_val
+    return checksum
+
+def create_motor_packet(m_values, stab, leak_ovr):
+    data_payload = f"{m_values[0]},{m_values[1]},{m_values[2]},{m_values[3]},{m_values[4]},{m_values[5]},{m_values[6]},{m_values[7]},{stab},{leak_ovr}"
+    data_to_checksum = PACKET_TYPE_MOTOR + b'|' + data_payload.encode('utf-8')
+    checksum = calculate_checksum(data_to_checksum)
+    packet = START_DELIMITER + PACKET_TYPE_MOTOR + b'|' + data_payload.encode('utf-8') + b'|' + hex(checksum)[2:].encode('utf-8') + END_DELIMITER
+    return packet
+
+def parse_sensor_packet(raw_packet):
+    """Parses a raw sensor packet and validates checksum.
+    Returns (temp, pres_bmp, pres_ms, depth, roll, pitch, leak_status) or None if invalid.
+    """
+    try:
+        if not raw_packet.startswith(START_DELIMITER) or not raw_packet.endswith(END_DELIMITER):
+            return None
+
+        content = raw_packet[len(START_DELIMITER):-len(END_DELIMITER)]
+        parts = content.split(b'|')
+        if len(parts) != 3 or parts[0] != PACKET_TYPE_SENSOR:
+            return None # Malformed packet structure or not a sensor packet
+
+        data_section = parts[1].decode('utf-8')
+        received_checksum_hex = parts[2].decode('utf-8')
+
+        data_to_checksum = PACKET_TYPE_SENSOR + b'|' + data_section.encode('utf-8')
+        calculated_checksum = calculate_checksum(data_to_checksum)
+        
+        received_checksum = int(received_checksum_hex, 16)
+
+        if calculated_checksum == received_checksum:
+            sensor_values = [float(x) if i < 6 else int(x) for i, x in enumerate(data_section.split(','))]
+            if len(sensor_values) == 7:
+                return sensor_values
+        else:
+            # print(f"Sensor Checksum mismatch! Received: {received_checksum_hex}, Calculated: {calculated_checksum:X}")
+            pass # Suppress frequent checksum errors for display
+    except Exception as e:
+        # print(f"Error parsing sensor packet: {e}") # Suppress frequent errors
+        pass
+    return None
+
+# =======================
+# SOCKET FUNCTIONS
+# =======================
+def connect_to_raspberry_pi():
+    global sock, connected
+    with socket_lock:
+        if sock:
+            sock.close()
+        sock = None
+        connected = False
+
+        while not shutdown_event.is_set() and not connected:
+            try:
+                print(f"Attempting to connect to Raspberry Pi at {RASPBERRY_PI_IP}:{PORT}...")
+                new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                new_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                new_sock.settimeout(1.0) # Set a timeout for initial connection
+                new_sock.connect((RASPBERRY_PI_IP, PORT))
+                new_sock.settimeout(0.1) # Set a non-blocking timeout for recv in telemetry thread
+                sock = new_sock
+                connected = True
+                print("Connected to Raspberry Pi.")
+                return True
+            except socket.error as e:
+                print(f"Connection failed: {e}. Retrying in {RECONNECT_DELAY} seconds...")
+                time.sleep(RECONNECT_DELAY)
+        return False
+
+def send_motor_data(packet):
+    global sock, connected
+    if not connected:
+        print("Not connected to Raspberry Pi. Attempting to reconnect...")
+        connect_to_raspberry_pi()
+        if not connected:
+            return
+
+    with socket_lock:
+        try:
+            sock.sendall(packet + b'\n') # Add newline for Raspberry Pi's read_until
+        except socket.error as e:
+            print(f"Send failed: {e}. Connection lost. Attempting to reconnect...")
+            connected = False
+            sock.close()
+            connect_to_raspberry_pi()
+
+def telemetry_receiver():
+    global sock, connected, temp_bmp, pres_bmp, pres_ms, depth_ms, roll_mpu, pitch_mpu, leak_status, leak_override
+    buffer = b''
+    while not shutdown_event.is_set():
+        if not connected or not sock:
+            time.sleep(0.1)
+            continue
+
+        try:
+            data = sock.recv(1024)
+            if not data:
+                print("Telemetry: Raspberry Pi disconnected.")
+                connected = False
+                with socket_lock:
+                    sock.close()
+                continue
+            
+            buffer += data
+
+            while True:
+                start_idx = buffer.find(START_DELIMITER)
+                end_idx = buffer.find(END_DELIMITER, start_idx if start_idx != -1 else 0)
+
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    raw_packet = buffer[start_idx : end_idx + len(END_DELIMITER)]
+                    sensor_values = parse_sensor_packet(raw_packet)
+
+                    if sensor_values:
+                        temp_bmp, pres_bmp, pres_ms, depth_ms, roll_mpu, pitch_mpu, leak_status = sensor_values
+                        if leak_status == 1:
+                            leak_override = 1 # Laptop also registers leak for display/safety
+                        else:
+                            leak_override = 0
+                    
+                    buffer = buffer[end_idx + len(END_DELIMITER):]
+                else:
+                    break
+
+            if len(buffer) > 2048: # Prevent buffer overflow
+                print("Telemetry buffer overflow, clearing...")
+                buffer = b''
+
+        except socket.timeout:
+            pass # No data received, continue loop
+        except socket.error as e:
+            print(f"Telemetry receive error: {e}. Reconnecting...")
+            connected = False
+            with socket_lock:
+                sock.close()
+            connect_to_raspberry_pi()
+        except Exception as e:
+            print(f"An unexpected error in telemetry receiver: {e}")
+            time.sleep(0.1)
+
+# =======================
+# JOYSTICK FUNCTIONS
+# =======================
+def init_joystick():
+    pygame.init()
+    pygame.joystick.init()
+    if pygame.joystick.get_count() == 0:
+        print("No joystick detected!")
+        sys.exit()
+    joy = pygame.joystick.Joystick(0)
+    joy.init()
+    print(f"Joystick detected: {joy.get_name()}")
+    return joy
+
+def apply_deadzone(value, deadzone):
+    if abs(value) < deadzone:
+        return 0.0
+    return value
+
+def clamp(value, min_val, max_val):
+    return max(min_val, min(value, max_val))
+
+# =======================
+# MAIN LOOP
+# =======================
+def main():
+    global grip_mode, rot_mode, R1_pressed, L1_pressed, SELECT_pressed, stab_mode, leak_override
+    joy = init_joystick()
+    connect_to_raspberry_pi()
+
+    # Start telemetry receiver thread
+    telemetry_thread = threading.Thread(target=telemetry_receiver)
+    telemetry_thread.daemon = True
+    telemetry_thread.start()
+
+    print("FULL ROV + ARM CONTROL READY")
+
+    try:
+        while not shutdown_event.is_set():
+            for event in pygame.event.get():
+                if event.type == pygame.JOYBUTTONDOWN:
+                    # Assuming 'SELECT' button is button 8 on a PS4 controller
+                    if event.button == 8 and not SELECT_pressed: 
+                        stab_mode = 1 - stab_mode # Toggle stabilization mode
+                        print(f"Stabilization Mode: {'ON' if stab_mode == 1 else 'OFF'}")
+                        SELECT_pressed = True
+                elif event.type == pygame.JOYBUTTONUP:
+                    if event.button == 8:
+                        SELECT_pressed = False
+
+            # Read joystick axes
+            y_axis = -apply_deadzone(joy.get_axis(1), DEADZONE)  # Left stick Y-axis
+            x_axis = apply_deadzone(joy.get_axis(0), DEADZONE)   # Left stick X-axis
+            z_axis = -apply_deadzone(joy.get_axis(3), DEADZONE)  # Right stick Y-axis (for vertical thrusters)
+
+            # Calculate motor speeds for ROV thrusters (simplified differential drive for now)
+            groupA = (y_axis + x_axis) * MAX_SPEED
+            groupB = (y_axis - x_axis) * MAX_SPEED
+
+            m1 = int(groupA) # Front Left
+            m2 = int(-groupB) # Front Right
+            m3 = int(-groupA) # Rear Left
+            m4 = int(-groupB) # Rear Right
+            m5 = int(z_axis * MAX_SPEED) # Vertical Left
+            m6 = int(z_axis * MAX_SPEED) # Vertical Right
+
+            # Read arm motor controls
+            current_R1 = joy.get_button(10)
+            current_L1 = joy.get_button(9)
+
+            if current_R1 and not R1_pressed:
+                grip_mode *= -1
+                R1_pressed = True
+            elif not current_R1:
+                R1_pressed = False
+
+            if current_L1 and not L1_pressed:
+                rot_mode *= -1
+                L1_pressed = True
+            elif not current_L1:
+                L1_pressed = False
+
+            R2_axis = joy.get_axis(5) # Right trigger
+            L2_axis = joy.get_axis(4) # Left trigger
+
+            grip_val = 0
+            if abs(R2_axis) > 0.05: # Apply deadzone for triggers
+                grip_val = int(((R2_axis + 1) / 2) * MAX_SPEED) * grip_mode
+            
+            rot_val = 0
+            if abs(L2_axis) > 0.05: # Apply deadzone for triggers
+                rot_val = int(((L2_axis + 1) / 2) * MAX_SPEED) * rot_mode
+
+            # Clamp all motor values to -255 to 255
+            motors = [
+                clamp(m1, -MAX_SPEED, MAX_SPEED),
+                clamp(m2, -MAX_SPEED, MAX_SPEED),
+                clamp(m3, -MAX_SPEED, MAX_SPEED),
+                clamp(m4, -MAX_SPEED, MAX_SPEED),
+                clamp(m5, -MAX_SPEED, MAX_SPEED),
+                clamp(m6, -MAX_SPEED, MAX_SPEED),
+                clamp(grip_val, -MAX_SPEED, MAX_SPEED),
+                clamp(rot_val, -MAX_SPEED, MAX_SPEED)
+            ]
+
+            # Apply emergency stop if leak detected by Arduino (reflected in leak_override)
+            if leak_override == 1:
+                motors = [0, 0, 0, 0, 0, 0, 0, 0]
+
+            # Create and send motor command packet
+            motor_packet = create_motor_packet(motors, stab_mode, leak_override)
+            send_motor_data(motor_packet)
+            
+            # Display sensor data and motor commands
+            sys.stdout.write(f"\rSending: {motor_packet.decode('utf-8').strip()} | "
+                             f"BMP Temp: {temp_bmp:.2f}C, Pres: {pres_bmp:.2f}hPa | "
+                             f"MS5837 Pres: {pres_ms:.2f}mbar, Depth: {depth_ms:.2f}m | "
+                             f"MPU Roll: {roll_mpu:.2f}, Pitch: {pitch_mpu:.2f} | "
+                             f"Leak: {'YES' if leak_status == 1 else 'NO'} | "
+                             f"Stab: {'ON' if stab_mode == 1 else 'OFF'}")
+            sys.stdout.flush()
+
+            time.sleep(0.05) # Small delay to prevent overwhelming the network/serial
+
+    except KeyboardInterrupt:
+        print("\nEmergency stop (Ctrl+C) detected. Stopping motors...")
+    except Exception as e:
+        print(f"\nAn error occurred: {e}")
+    finally:
+        shutdown_event.set() # Signal telemetry thread to stop
+        # Send final stop command
+        stop_motors = [0, 0, 0, 0, 0, 0, 0, 0]
+        stop_packet = create_motor_packet(stop_motors, 0, 1) # Send leak_override=1 to ensure stop
+        print(f"Sending final stop command: {stop_packet.decode('utf-8').strip()}")
+        send_motor_data(stop_packet)
+        if sock:
+            with socket_lock:
+                sock.close()
+        pygame.quit()
+        print("System shut down.")
+
+if __name__ == "__main__":
+    main()
+
+--------------------------------
+Raspberry Controller :
+--------------------------------
+import socket
+import serial
+import time
+import threading
+import binascii
+
+# =======================
+# CONFIGURABLE SETTINGS
+# =======================
+HOST = '0.0.0.0'  # Listen on all available interfaces
+PORT = 5000       # Port for TCP connection
+SERIAL_PORT = '/dev/ttyACM0' # Arduino serial port
+BAUDRATE = 9600   # Arduino serial baudrate
+RETRY_INTERVAL = 5 # Seconds to wait before retrying connection
+
+# =======================
+# COMMUNICATION PROTOCOL DEFINITIONS
+# =======================
+START_DELIMITER = b'<'
+END_DELIMITER = b'>'
+PACKET_TYPE_MOTOR = b'M'
+PACKET_TYPE_SENSOR = b'S'
+
+# Global flag for graceful shutdown
+shutdown_flag = threading.Event()
+
+# Global variable to hold the serial connection
+ser = None
+serial_lock = threading.Lock()
+
+# List to hold client connections for sending sensor data
+connected_clients = []
+client_lock = threading.Lock()
+
+def calculate_checksum(data_bytes):
+    checksum = 0
+    for byte_val in data_bytes:
+        checksum ^= byte_val
+    return checksum
+
+def setup_serial():
+    """Sets up and returns a serial connection to Arduino."""
+    global ser
+    with serial_lock:
+        if ser and ser.is_open:
+            ser.close()
+        ser = None # Clear stale reference
+
+        while not shutdown_flag.is_set():
+            try:
+                print(f"Attempting to connect to Arduino on {SERIAL_PORT} at {BAUDRATE} baud...")
+                new_ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
+                ser = new_ser
+                print("Arduino connected.")
+                return ser
+            except serial.SerialException as e:
+                print(f"Error connecting to Arduino: {e}. Retrying in {RETRY_INTERVAL} seconds...")
+                time.sleep(RETRY_INTERVAL)
+    return None
+
+def parse_packet(raw_packet):
+    """Parses a raw packet string and validates checksum.
+    Returns (packet_type, data_payload) or None if invalid.
+    """
+    try:
+        if not raw_packet.startswith(START_DELIMITER) or not raw_packet.endswith(END_DELIMITER):
+            return None
+
+        # Remove delimiters
+        content = raw_packet[len(START_DELIMITER):-len(END_DELIMITER)]
+        
+        parts = content.split(b'|')
+        if len(parts) != 3:
+            return None # Malformed packet structure
+
+        packet_type = parts[0]
+        data_section = parts[1]
+        received_checksum_hex = parts[2]
+
+        # Calculate checksum of type + data
+        data_to_checksum = packet_type + b'|' + data_section
+        calculated_checksum = calculate_checksum(data_to_checksum)
+        
+        # Convert received checksum from hex string to byte
+        received_checksum = int(received_checksum_hex, 16)
+
+        if calculated_checksum == received_checksum:
+            return packet_type, data_section.decode('utf-8')
+        else:
+            print(f"Checksum mismatch! Received: {received_checksum_hex.decode()}, Calculated: {calculated_checksum:X}")
+            return None
+    except Exception as e:
+        print(f"Error parsing packet: {e}")
+        return None
+
+def read_from_arduino():
+    """Continuously reads data from Arduino, parses it, and forwards to connected clients."""
+    global ser
+    buffer = b''
+    while not shutdown_flag.is_set():
+        if ser and ser.is_open:
+            try:
+                # Read byte by byte to handle partial packets
+                if ser.in_waiting > 0:
+                    byte = ser.read(1)
+                    buffer += byte
+
+                    if byte == END_DELIMITER:
+                        # Attempt to find a complete packet in the buffer
+                        start_idx = buffer.rfind(START_DELIMITER)
+                        if start_idx != -1:
+                            potential_packet = buffer[start_idx:]
+                            packet_type, data_payload = parse_packet(potential_packet)
+                            if packet_type == PACKET_TYPE_SENSOR:
+                                # Reconstruct the valid packet to forward
+                                full_packet_to_forward = potential_packet.decode('utf-8')
+                                # print(f"Forwarding sensor: {full_packet_to_forward}") # Debugging
+                                with client_lock:
+                                    for client_conn in list(connected_clients): # Iterate over a copy
+                                        try:
+                                            client_conn.sendall((full_packet_to_forward + '\n').encode('utf-8'))
+                                        except socket.error as e:
+                                            print(f"Error sending sensor data to client: {e}. Removing client.")
+                                            connected_clients.remove(client_conn)
+                                            client_conn.close()
+                            # Clear processed part of the buffer
+                            buffer = buffer[start_idx + len(potential_packet):] # Should be empty if packet was at end
+                            if buffer and buffer[0] == END_DELIMITER: # Handle case where END_DELIMITER is duplicated
+                                buffer = buffer[1:]
+                        else:
+                            # No start delimiter found, clear buffer if it's getting too long
+                            if len(buffer) > SERIAL_BUFFER_SIZE * 2: # Prevent buffer overflow
+                                buffer = b''
+
+            except serial.SerialException as e:
+                print(f"Serial read error: {e}. Attempting to re-establish serial connection.")
+                setup_serial() # Re-establish serial connection
+                buffer = b'' # Clear buffer on serial error
+            except Exception as e:
+                print(f"Error reading from Arduino: {e}")
+                buffer = b'' # Clear buffer on other errors
+        time.sleep(0.005) # Small delay to prevent busy-waiting
+
+def handle_client(conn, addr):
+    """Handles communication with a connected laptop client."""
+    global ser
+    print(f"Connected from: {addr}")
+    buffer = b''
+
+    with client_lock:
+        connected_clients.append(conn)
+
+    try:
+        while not shutdown_flag.is_set():
+            data = conn.recv(1024)
+            if not data:
+                print(f"Client {addr} disconnected.")
+                break
+            
+            buffer += data
+            
+            # Process all complete packets in the buffer
+            while True:
+                start_idx = buffer.find(START_DELIMITER)
+                end_idx = buffer.find(END_DELIMITER, start_idx if start_idx != -1 else 0)
+
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    raw_packet = buffer[start_idx : end_idx + len(END_DELIMITER)]
+                    packet_type, data_payload = parse_packet(raw_packet)
+
+                    if packet_type == PACKET_TYPE_MOTOR:
+                        # print(f"Received motor command from Laptop: {data_payload}") # Debugging
+                        if ser and ser.is_open:
+                            with serial_lock:
+                                try:
+                                    # Forward data to Arduino (motor commands)
+                                    ser.write(raw_packet + b'\n') # Add newline for Arduino Serial.readStringUntil
+                                except serial.SerialException as e:
+                                    print(f"Serial write error: {e}. Attempting to re-establish serial connection.")
+                                    setup_serial() # Re-establish serial connection
+                                    if ser:
+                                        ser.write(raw_packet + b'\n') # Try writing again
+                                    else:
+                                        print("Failed to re-establish serial connection. Data lost.")
+                        else:
+                            print("Serial connection not available. Data not sent to Arduino.")
+                    
+                    # Remove the processed packet from the buffer
+                    buffer = buffer[end_idx + len(END_DELIMITER):]
+                else:
+                    break # No complete packet found
+
+            # Prevent buffer from growing indefinitely if no end delimiter is found
+            if len(buffer) > SERIAL_BUFFER_SIZE * 2:
+                print("TCP buffer overflow, clearing...")
+                buffer = b''
+
+    except Exception as e:
+        print(f"Error handling client {addr}: {e}")
+    finally:
+        with client_lock:
+            if conn in connected_clients:
+                connected_clients.remove(conn)
+        conn.close()
+        print(f"Connection with {addr} closed.")
+
+def main():
+    global ser
+    server_socket = None
+    try:
+        ser = setup_serial()
+        if not ser:
+            print("Could not establish serial connection. Exiting.")
+            return
+
+        # Start thread to read from Arduino
+        arduino_read_thread = threading.Thread(target=read_from_arduino)
+        arduino_read_thread.daemon = True
+        arduino_read_thread.start()
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.settimeout(1) # Set a timeout for accept to check shutdown_flag
+
+        print(f"Starting TCP server on {HOST}:{PORT}...")
+        server_socket.bind((HOST, PORT))
+        server_socket.listen(5) # Allow multiple client connections
+        print("Waiting for laptop connection...")
+
+        while not shutdown_flag.is_set():
+            try:
+                conn, addr = server_socket.accept()
+                # Start a new thread to handle the client connection
+                client_handler = threading.Thread(target=handle_client, args=(conn, addr))
+                client_handler.daemon = True # Allow main program to exit even if threads are running
+                client_handler.start()
+            except socket.timeout:
+                continue # Timeout occurred, check shutdown_flag again
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+                time.sleep(RETRY_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("Shutdown initiated by user (Ctrl+C).")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+    finally:
+        print("Server shutting down...")
+        shutdown_flag.set()
+        if ser and ser.is_open:
+            with serial_lock:
+                # Send stop command to Arduino before closing serial
+                try:
+                    # Construct a stop command packet
+                    stop_data_payload = b'0,0,0,0,0,0,0,0,0,0'
+                    stop_packet_type = PACKET_TYPE_MOTOR
+                    data_to_checksum = stop_packet_type + b'|' + stop_data_payload
+                    checksum = calculate_checksum(data_to_checksum)
+                    stop_packet = START_DELIMITER + stop_packet_type + b'|' + stop_data_payload + b'|' + hex(checksum)[2:].encode() + END_DELIMITER + b'\n'
+                    ser.write(stop_packet)
+                    print("Sent stop command to Arduino.")
+                except serial.SerialException as e:
+                    print(f"Error sending stop command to Arduino: {e}")
+                ser.close()
+                print("Arduino serial connection closed.")
+        if server_socket:
+            server_socket.close()
+            print("TCP server socket closed.")
+
+if __name__ == "__main__":
+    main()
+
+---------------------------------
+Arduino Code :
+---------------------------------
+// ==========================================
+// Arduino Mega ROV + ARM Control Code with Sensors (Robust Version)
+// ==========================================
+
+#include <Wire.h> // Required for I2C communication
+#include <Adafruit_BMP280.h> // For BMP280
+#include <MS5837.h> // For MS5837
+#include <Adafruit_MPU6050.h> // For MPU6050
+#include <Adafruit_Sensor.h> // Required for Adafruit sensors
+#include <MadgwickAHRS.h> // For MPU6050 filtering (or similar AHRS library)
+
+// =======================
+// ROV MOTORS PIN MAPPING (Existing)
+// =======================
+#define M1_R_PWM 13
+#define M1_L_PWM 12
+#define M2_R_PWM 11
+#define M2_L_PWM 10
+#define M3_R_PWM 44
+#define M3_L_PWM 8
+#define M4_R_PWM 3
+#define M4_L_PWM 2
+#define M5_R_PWM 7
+#define M5_L_PWM 6
+#define M6_R_PWM 5
+#define M6_L_PWM 4
+
+// =======================
+// ARM MOTORS PIN MAPPING (Existing)
+// =======================
+#define GRIP_R_PWM 47
+#define GRIP_L_PWM 49
+#define GRIP_R_IS A15
+#define GRIP_L_IS A14
+#define ROT_R_PWM 45
+#define ROT_L_PWM 46
+
+// =======================
+// SENSOR PIN MAPPING
+// =======================
+#define RAIN_SENSOR_PIN A0 // Analog pin for Rain Sensor
+
+// =======================
+// SETTINGS (Existing)
+// =======================
+#define CURRENT_LIMIT 600 // Analog read value for overcurrent threshold
+#define CURRENT_CHECK_DELAY 20 // Milliseconds between current checks
+unsigned long lastCheck = 0;
+
+// =======================
+// GLOBAL SENSOR OBJECTS
+// =======================
+Adafruit_BMP280 bmp; // I2C
+MS5837 ms5837; // I2C
+Adafruit_MPU6050 mpu; // I2C
+Madgwick filter; // For MPU6050 AHRS
+
+// =======================
+// GLOBAL SENSOR DATA & CONTROL FLAGS
+// =======================
+float temp_bmp = 0.0;
+float pres_bmp = 0.0;
+float pres_ms = 0.0;
+float depth_ms = 0.0;
+float roll_mpu = 0.0;
+float pitch_mpu = 0.0;
+float yaw_mpu = 0.0;
+int leak_status = 0; // 0 = No Leak, 1 = Leak Detected
+int stab_mode = 0; // 0 = OFF, 1 = ON
+bool system_emergency_stop = false; // Flag for system-wide emergency stop
+
+// Sensor status flags
+bool bmp_ok = false;
+bool ms5837_ok = false;
+bool mpu_ok = false;
+
+// Communication Watchdog
+unsigned long last_command_time = 0;
+const unsigned long COMMAND_TIMEOUT_MS = 1000; // 1 second timeout
+
+// Rain Sensor Debounce
+const int LEAK_DEBOUNCE_COUNT = 5; // Number of consecutive readings to confirm leak
+int leak_confirm_count = 0;
+
+// Depth Moving Average Filter
+const int DEPTH_FILTER_SIZE = 10; // Number of samples for moving average
+float depth_samples[DEPTH_FILTER_SIZE];
+int depth_sample_index = 0;
+
+// =======================
+// COMMUNICATION PROTOCOL DEFINITIONS
+// =======================
+#define START_DELIMITER '<'
+#define END_DELIMITER '>'
+#define PACKET_TYPE_MOTOR 'M'
+#define PACKET_TYPE_SENSOR 'S'
+
+// Serial buffer for incoming data
+const int SERIAL_BUFFER_SIZE = 128;
+char serial_rx_buffer[SERIAL_BUFFER_SIZE];
+int serial_rx_idx = 0;
+
+// =======================
+// MOTOR CONTROL FUNCTION (Existing)
+// =======================
+void setMotor(int speed, int r_pwm_pin, int l_pwm_pin) {
+  int abs_speed = abs(speed);
+  abs_speed = constrain(abs_speed, 0, 255); // PWM range 0-255
+
+  if (speed > 0) { // Forward
+    analogWrite(r_pwm_pin, abs_speed);
+    analogWrite(l_pwm_pin, 0);
+  } else if (speed < 0) { // Reverse
+    analogWrite(r_pwm_pin, 0);
+    analogWrite(l_pwm_pin, abs_speed);
+  } else { // Stop
+    analogWrite(r_pwm_pin, 0);
+    analogWrite(l_pwm_pin, 0);
+  }
+}
+
+// =======================
+// CURRENT PROTECTION FOR GRIPPER (Existing)
+// =======================
+bool checkGripOverCurrent(int speed) {
+  if (millis() - lastCheck < CURRENT_CHECK_DELAY)
+    return false;
+  lastCheck = millis();
+
+  int currentValue = 0;
+  if (speed > 0) { // Gripper opening
+    currentValue = analogRead(GRIP_R_IS);
+  } else if (speed < 0) { // Gripper closing
+    currentValue = analogRead(GRIP_L_IS);
+  } else { // Gripper stopped
+    return false;
+  }
+
+  if (currentValue > CURRENT_LIMIT) {
+    // Stop gripper motor
+    analogWrite(GRIP_R_PWM, 0);
+    analogWrite(GRIP_L_PWM, 0);
+    Serial.println("GRIP OVERCURRENT - STOPPED");
+    return true;
+  }
+  return false;
+}
+
+// =======================
+// CHECKSUM CALCULATION
+// =======================
+byte calculateChecksum(const char* data, int len) {
+  byte checksum = 0;
+  for (int i = 0; i < len; i++) {
+    checksum ^= data[i];
+  }
+  return checksum;
+}
+
+// =======================
+// SENSOR READING FUNCTIONS
+// =======================
+void readBMP280() {
+  if (bmp_ok) {
+    temp_bmp = bmp.readTemperature();
+    pres_bmp = bmp.readPressure() / 100.0F; // Convert Pa to hPa
+  }
+}
+
+void readMS5837() {
+  if (ms5837_ok) {
+    ms5837.read();
+    pres_ms = ms5837.pressure();
+    float current_depth = ms5837.depth();
+
+    // Moving average filter for depth
+    depth_samples[depth_sample_index] = current_depth;
+    depth_sample_index = (depth_sample_index + 1) % DEPTH_FILTER_SIZE;
+
+    float sum_depth = 0;
+    for (int i = 0; i < DEPTH_FILTER_SIZE; i++) {
+      sum_depth += depth_samples[i];
+    }
+    depth_ms = sum_depth / DEPTH_FILTER_SIZE;
+  }
+}
+
+void readMPU6050() {
+  if (mpu_ok) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    // Update Madgwick filter with gyroscope and accelerometer data
+    // Gyroscope values are in rad/s, accelerometer in m/s^2
+    filter.updateIMU(g.gyro.x, g.gyro.y, g.gyro.z, a.acceleration.x, a.acceleration.y, a.acceleration.z);
+
+    // Get Euler angles from the filter
+    roll_mpu = filter.getRoll();
+    pitch_mpu = filter.getPitch();
+    yaw_mpu = filter.getYaw(); // Not used for stabilization, but good for monitoring
+  }
+}
+
+void checkRainSensor() {
+  // Assuming the rain sensor outputs HIGH when dry, LOW when wet (leak detected)
+  int rainSensorValue = analogRead(RAIN_SENSOR_PIN);
+  if (rainSensorValue < 500) { // Threshold for leak detection (adjust as needed)
+    leak_confirm_count++;
+    if (leak_confirm_count >= LEAK_DEBOUNCE_COUNT) {
+      if (leak_status == 0) { // Only trigger if it was previously not leaking
+        leak_status = 1; // Leak Detected
+        Serial.println("LEAK DETECTED! Initiating emergency stop.");
+        system_emergency_stop = true;
+      }
+    }
+  } else {
+    leak_confirm_count = 0; // Reset counter if dry
+    leak_status = 0; // No Leak
+  }
+}
+
+// =======================
+// SETUP (Modified)
+// =======================
+void setup() {
+  Serial.begin(9600);
+  while (!Serial) { 
+    delay(10);
+  }
+  Serial.println("Arduino Mega ROV + ARM with Sensors Initializing...");
+
+  // Initialize motor pins as OUTPUT (Existing)
+  pinMode(M1_R_PWM, OUTPUT);
+  pinMode(M1_L_PWM, OUTPUT);
+  pinMode(M2_R_PWM, OUTPUT);
+  pinMode(M2_L_PWM, OUTPUT);
+  pinMode(M3_R_PWM, OUTPUT);
+  pinMode(M3_L_PWM, OUTPUT);
+  pinMode(M4_R_PWM, OUTPUT);
+  pinMode(M4_L_PWM, OUTPUT);
+  pinMode(M5_R_PWM, OUTPUT);
+  pinMode(M5_L_PWM, OUTPUT);
+  pinMode(M6_R_PWM, OUTPUT);
+  pinMode(M6_L_PWM, OUTPUT);
+  
+  pinMode(GRIP_R_PWM, OUTPUT);
+  pinMode(GRIP_L_PWM, OUTPUT);
+  pinMode(ROT_R_PWM, OUTPUT);
+  pinMode(ROT_L_PWM, OUTPUT);
+
+  // Initialize current sensor pins as INPUT (Existing)
+  pinMode(GRIP_R_IS, INPUT);
+  pinMode(GRIP_L_IS, INPUT);
+
+  // Initialize Rain Sensor pin
+  pinMode(RAIN_SENSOR_PIN, INPUT); // Assuming analog input for now
+
+  // Initialize I2C sensors
+  Wire.begin();
+
+  // BMP280
+  if (!bmp.begin()) {
+    Serial.println(F("Could not find a valid BMP280 sensor, check wiring!"));
+    bmp_ok = false;
+  } else {
+    Serial.println("BMP280 found.");
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     // Operating Mode
+                     Adafruit_BMP280::SAMPLING_X2,     // Temp. oversampling
+                     Adafruit_BMP280::SAMPLING_X16,    // Pressure oversampling
+                     Adafruit_BMP280::FILTER_X16,      // Filtering
+                     Adafruit_BMP280::STANDBY_MS_500); // Standby time
+    bmp_ok = true;
+  }
+
+  // MS5837
+  if (!ms5837.init()) {
+    Serial.println("MS5837 sensor not found.");
+    ms5837_ok = false;
+  } else {
+    ms5837.setModel(MS5837::MS5837_30BA); // Or MS5837_02BA depending on your sensor
+    ms5837.setFluidDensity(1000); // kg/m^3 (freshwater)
+    Serial.println("MS5837 found.");
+    ms5837_ok = true;
+  }
+
+  // MPU6050
+  if (!mpu.begin()) {
+    Serial.println("Failed to find MPU6050 chip");
+    mpu_ok = false;
+  } else {
+    Serial.println("MPU6050 found!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpu_ok = true;
+    filter.begin(50); // Initialize Madgwick filter with update rate (Hz)
+  }
+
+  // Initialize depth filter samples
+  for (int i = 0; i < DEPTH_FILTER_SIZE; i++) {
+    depth_samples[i] = 0.0;
+  }
+
+  Serial.println("Arduino Mega ROV + ARM with Sensors READY");
+  last_command_time = millis(); // Initialize watchdog timer
+}
+
+// =======================
+// LOOP (Modified)
+// =======================
+void loop() {
+  // Check for leak first (HIGH PRIORITY)
+  checkRainSensor();
+
+  // Read sensor data periodically
+  static unsigned long lastSensorReadTime = 0;
+  if (millis() - lastSensorReadTime > 50) { // Read sensors every 50ms (20Hz)
+    readBMP280();
+    readMS5837();
+    readMPU6050();
+    lastSensorReadTime = millis();
+  }
+
+  // Communication Watchdog
+  if (millis() - last_command_time > COMMAND_TIMEOUT_MS) {
+    if (!system_emergency_stop) {
+      Serial.println("COMMUNICATION TIMEOUT! Initiating emergency stop.");
+      system_emergency_stop = true;
+    }
+  }
+
+  // Handle incoming serial data with robust parsing
+  while (Serial.available()) {
+    char inChar = Serial.read();
+    if (inChar == START_DELIMITER) {
+      serial_rx_idx = 0;
+    } else if (inChar == END_DELIMITER) {
+      serial_rx_buffer[serial_rx_idx] = '\0'; // Null-terminate the string
+      
+      // Parse packet
+      char packet_type = serial_rx_buffer[0];
+      char* data_str = serial_rx_buffer + 2; // Skip type and '|'
+      char* checksum_str = strrchr(data_str, '|');
+
+      if (checksum_str != NULL) {
+        *checksum_str = '\0'; // Null-terminate data_str
+        checksum_str++; // Move past '|'
+        byte received_checksum = (byte)strtol(checksum_str, NULL, 16);
+        byte calculated_checksum = calculateChecksum(serial_rx_buffer, strlen(serial_rx_buffer));
+
+        if (received_checksum == calculated_checksum) {
+          // Valid packet received
+          last_command_time = millis(); // Reset watchdog
+          system_emergency_stop = false; // Clear emergency stop from watchdog
+
+          if (packet_type == PACKET_TYPE_MOTOR) {
+            // Parse motor command data
+            int m_values[10];
+            char* token;
+            int i = 0;
+            token = strtok(data_str, ",");
+            while (token != NULL && i < 10) {
+              m_values[i++] = atoi(token);
+              token = strtok(NULL, ",");
+            }
+
+            if (i == 10) { // Ensure all 10 values are parsed
+              int m1 = m_values[0];
+              int m2 = m_values[1];
+              int m3 = m_values[2];
+              int m4 = m_values[3];
+              int m5 = m_values[4];
+              int m6 = m_values[5];
+              int grip = m_values[6];
+              int rot = m_values[7];
+              stab_mode = m_values[8];
+              int leak_override_from_laptop = m_values[9];
+
+              // Highest priority safety: Leak detection or Laptop emergency override
+              if (leak_status == 1 || leak_override_from_laptop == 1) {
+                m1 = m2 = m3 = m4 = m5 = m6 = grip = rot = 0;
+                system_emergency_stop = true; // Ensure local flag is set
+              } else if (system_emergency_stop) { // If emergency stop was due to watchdog, clear it now
+                 // Only clear if no leak and no laptop override
+                 system_emergency_stop = false;
+              }
+
+              // Stabilization Logic for M5, M6
+              if (stab_mode == 1 && mpu_ok && !system_emergency_stop) {
+                float Kp_roll = 5; // Proportional constant for roll (tune this)
+                float Kp_pitch = 5; // Proportional constant for pitch (tune this)
+
+                int roll_correction = (int)(roll_mpu * Kp_roll);
+                int pitch_correction = (int)(pitch_mpu * Kp_pitch);
+
+                m5 = constrain(m5 + pitch_correction - roll_correction, -255, 255);
+                m6 = constrain(m6 + pitch_correction + roll_correction, -255, 255);
+              }
+
+              // Control ROV thrusters
+              setMotor(m1, M1_R_PWM, M1_L_PWM);
+              setMotor(m2, M2_R_PWM, M2_L_PWM);
+              setMotor(m3, M3_R_PWM, M3_L_PWM);
+              setMotor(m4, M4_R_PWM, M4_L_PWM);
+              setMotor(m5, M5_R_PWM, M5_L_PWM);
+              setMotor(m6, M6_R_PWM, M6_L_PWM);
+
+              // Control robotic arm motors with overcurrent protection for gripper
+              bool overload = checkGripOverCurrent(grip);
+              if (!overload) {
+                setMotor(grip, GRIP_R_PWM, GRIP_L_PWM);
+              }
+              setMotor(rot, ROT_R_PWM, ROT_L_PWM);
+            } else {
+              Serial.println("Error: Malformed MOTOR packet data.");
+            }
+          }
+        } else {
+          Serial.print("Checksum mismatch! Received: ");
+          Serial.print(received_checksum, HEX);
+          Serial.print(", Calculated: ");
+          Serial.println(calculated_checksum, HEX);
+        }
+      } else {
+        Serial.println("Error: Checksum delimiter not found.");
+      }
+      serial_rx_idx = 0; // Reset buffer index
+    } else {
+      if (serial_rx_idx < SERIAL_BUFFER_SIZE - 1) {
+        serial_rx_buffer[serial_rx_idx++] = inChar;
+      }
+    }
+  }
+
+  // If system is in emergency stop, ensure all motors are off
+  if (system_emergency_stop) {
+    setMotor(0, M1_R_PWM, M1_L_PWM);
+    setMotor(0, M2_R_PWM, M2_L_PWM);
+    setMotor(0, M3_R_PWM, M3_L_PWM);
+    setMotor(0, M4_R_PWM, M4_L_PWM);
+    setMotor(0, M5_R_PWM, M5_L_PWM);
+    setMotor(0, M6_R_PWM, M6_L_PWM);
+    setMotor(0, GRIP_R_PWM, GRIP_L_PWM);
+    setMotor(0, ROT_R_PWM, ROT_L_PWM);
+  }
+
+  // Send sensor data to Raspberry Pi periodically
+  static unsigned long lastSensorSendTime = 0;
+  if (millis() - lastSensorSendTime > 200) { // Send sensor data every 200ms
+    char sensor_data_buffer[SERIAL_BUFFER_SIZE];
+    int len = snprintf(sensor_data_buffer, SERIAL_BUFFER_SIZE, "%c|%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%d",
+                       PACKET_TYPE_SENSOR,
+                       bmp_ok ? temp_bmp : 0.0,
+                       bmp_ok ? pres_bmp : 0.0,
+                       ms5837_ok ? pres_ms : 0.0,
+                       ms5837_ok ? depth_ms : 0.0,
+                       mpu_ok ? roll_mpu : 0.0,
+                       mpu_ok ? pitch_mpu : 0.0,
+                       leak_status);
+    
+    byte checksum = calculateChecksum(sensor_data_buffer, len);
+
+    Serial.print(START_DELIMITER);
+    Serial.print(sensor_data_buffer);
+    Serial.print("|");
+    Serial.print(checksum, HEX);
+    Serial.println(END_DELIMITER);
+    lastSensorSendTime = millis();
+  }
+}
